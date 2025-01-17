@@ -2,7 +2,8 @@
 
 #include <CommonIncludes.h>
 
-enum OP_TYPE {
+enum OP_TYPE
+{
     OP_ACCEPT,
     OP_RECV,
     OP_SEND
@@ -11,8 +12,8 @@ enum OP_TYPE {
 // Per-socket I/O context
 struct PER_SOCKET_CONTEXT
 {
-    SOCKET socket;
     OVERLAPPED overlapped;
+    SOCKET socket;
     WSABUF wsabuf;
     char buffer[1024];
     DWORD bytesTransferred;
@@ -55,5 +56,6 @@ private:
     HANDLE m_hIOCP;
     std::vector<HANDLE> m_workerThreads;
     bool m_running;
-};
 
+    ConsoleLogger& m_logger;
+};

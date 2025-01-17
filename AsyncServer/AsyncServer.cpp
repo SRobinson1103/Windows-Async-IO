@@ -1,71 +1,70 @@
 #include "AsyncServer.h"
 
-// --------------------------------------------------
-// Constructor / Destructor
-// --------------------------------------------------
-
 AsyncIOCPServer::AsyncIOCPServer(int port, int workerThreadCount)
     : m_port(port),
     m_workerThreadCount(workerThreadCount),
     m_listenSocket(INVALID_SOCKET),
     m_hIOCP(NULL),
-    m_running(false)
+    m_running(false),
+    m_logger(ConsoleLogger::getInstance())
 {
 }
 
 AsyncIOCPServer::~AsyncIOCPServer()
 {
-    Stop(); // Ensure cleanup if not already done
+    // Ensure cleanup if not already done
+    Stop();
 }
-
-// --------------------------------------------------
-// Public Methods
-// --------------------------------------------------
 
 bool AsyncIOCPServer::Start()
 {
-    if (!initWinsock()) {
-        std::cerr << "[SERVER] Winsock initialization failed.\n";
+    if (!initWinsock())
+    {
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] Winsock initialization failed.\n");
         return false;
     }
 
-    if (!createListenSocket()) {
-        std::cerr << "[SERVER] createListenSocket failed.\n";
+    if (!createListenSocket())
+    {
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] createListenSocket failed.\n");
         return false;
     }
 
     // Create IO Completion Port
     m_hIOCP = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, m_workerThreadCount);
-    if (!m_hIOCP) {
-        std::cerr << "[SERVER] CreateIoCompletionPort failed: " << GetLastError() << "\n";
+    if (!m_hIOCP)
+    {
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] CreateIoCompletionPort failed: " + std::to_string(GetLastError()) + "\n");
         return false;
     }
 
     // Associate the listen socket with IOCP
-    if (!associateDeviceToIOCP(reinterpret_cast<HANDLE>(m_listenSocket))) {
-        std::cerr << "[SERVER] Failed to associate listen socket to IOCP.\n";
+    if (!associateDeviceToIOCP(reinterpret_cast<HANDLE>(m_listenSocket)))
+    {
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] Failed to associate listen socket to IOCP.\n");
         return false;
     }
 
     // Create worker threads
-    for (int i = 0; i < m_workerThreadCount; ++i) {
-        HANDLE hThread = CreateThread(
-            nullptr, 0, workerThread, this, 0, nullptr
-        );
-        if (!hThread) {
-            std::cerr << "[SERVER] CreateThread failed: " << GetLastError() << "\n";
+    for (int i = 0; i < m_workerThreadCount; ++i)
+    {
+        HANDLE hThread = CreateThread(nullptr, 0, workerThread, this, 0, nullptr);
+        if (!hThread)
+        {
+            m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] CreateThread failed: " + std::to_string(GetLastError()) + "\n");
             return false;
         }
         m_workerThreads.push_back(hThread);
     }
 
     // Post initial AcceptEx calls
-    if (!postInitialAccepts(m_workerThreadCount)) {
-        std::cerr << "[SERVER] postInitialAccepts failed.\n";
+    if (!postInitialAccepts(m_workerThreadCount))
+    {
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] postInitialAccepts failed.\n");
         return false;
     }
 
-    std::cout << "[SERVER] Listening on port " << m_port << "...\n";
+    m_logger.log(ConsoleLogger::LogLevel::INFO, "[SERVER] Listening on port " + std::to_string(m_port) + "...\n");
     m_running = true;
 
     return true;
@@ -75,8 +74,7 @@ void AsyncIOCPServer::Stop()
 {
     if (!m_running) return;
 
-    // Signal threads to stop if needed (in advanced scenarios).
-    // For now, we just close the IOCP handle to break GetQueuedCompletionStatus.
+    //close the IOCP handle to break GetQueuedCompletionStatus.
 
     CloseHandle(m_hIOCP);
     m_hIOCP = NULL;
@@ -98,19 +96,16 @@ void AsyncIOCPServer::Stop()
     WSACleanup();
 
     m_running = false;
-    std::cout << "[SERVER] Stopped.\n";
+    m_logger.log(ConsoleLogger::LogLevel::INFO, "[SERVER] Stopped.\n");
 }
-
-// --------------------------------------------------
-// Private Methods
-// --------------------------------------------------
 
 bool AsyncIOCPServer::initWinsock()
 {
     WSADATA wsaData;
     int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-    if (result != 0) {
-        std::cerr << "[SERVER] WSAStartup failed with error: " << result << "\n";
+    if (result != 0)
+    {
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] WSAStartup failed with error: " + std::to_string(result) + "\n");
         return false;
     }
     return true;
@@ -120,7 +115,7 @@ bool AsyncIOCPServer::createListenSocket()
 {
     m_listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (m_listenSocket == INVALID_SOCKET) {
-        std::cerr << "[SERVER] socket() failed: " << WSAGetLastError() << "\n";
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] socket() failed: " + std::to_string(WSAGetLastError()) + "\n");
         return false;
     }
 
@@ -129,15 +124,17 @@ bool AsyncIOCPServer::createListenSocket()
     serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
     serverAddr.sin_port = htons(static_cast<u_short>(m_port));
 
-    if (bind(m_listenSocket, reinterpret_cast<SOCKADDR*>(&serverAddr), sizeof(serverAddr)) == SOCKET_ERROR) {
-        std::cerr << "[SERVER] bind() failed: " << WSAGetLastError() << "\n";
+    if (bind(m_listenSocket, reinterpret_cast<SOCKADDR*>(&serverAddr), sizeof(serverAddr)) == SOCKET_ERROR)
+    {
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] bind() failed: " + std::to_string(WSAGetLastError()) + "\n");
         closesocket(m_listenSocket);
         m_listenSocket = INVALID_SOCKET;
         return false;
     }
 
-    if (listen(m_listenSocket, SOMAXCONN) == SOCKET_ERROR) {
-        std::cerr << "[SERVER] listen() failed: " << WSAGetLastError() << "\n";
+    if (listen(m_listenSocket, SOMAXCONN) == SOCKET_ERROR)
+    {
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] listen() failed: " + std::to_string(WSAGetLastError()) + "\n");
         closesocket(m_listenSocket);
         m_listenSocket = INVALID_SOCKET;
         return false;
@@ -149,8 +146,9 @@ bool AsyncIOCPServer::createListenSocket()
 bool AsyncIOCPServer::associateDeviceToIOCP(HANDLE device, ULONG_PTR completionKey)
 {
     HANDLE h = CreateIoCompletionPort(device, m_hIOCP, completionKey, m_workerThreadCount);
-    if (!h) {
-        std::cerr << "[SERVER] CreateIoCompletionPort (associate device) failed: " << GetLastError() << "\n";
+    if (!h)
+    {
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] CreateIoCompletionPort (associate device) failed: " + std::to_string(GetLastError()) + "\n");
         return false;
     }
     return true;
@@ -158,9 +156,11 @@ bool AsyncIOCPServer::associateDeviceToIOCP(HANDLE device, ULONG_PTR completionK
 
 bool AsyncIOCPServer::postInitialAccepts(int count)
 {
-    for (int i = 0; i < count; ++i) {
+    for (int i = 0; i < count; ++i)
+    {
         SOCKET acceptSocket;
-        if (!createAcceptSocket(acceptSocket)) {
+        if (!createAcceptSocket(acceptSocket)) 
+        {
             return false;
         }
 
@@ -168,9 +168,11 @@ bool AsyncIOCPServer::postInitialAccepts(int count)
         PER_SOCKET_CONTEXT* ctx = new PER_SOCKET_CONTEXT{};
         ctx->socket = acceptSocket;
         ctx->operation = OP_ACCEPT;
+        m_logger.log(ConsoleLogger::LogLevel::VERBOSE, "[SERVER] Posting AcceptEx with OP_ACCEPT.\n");
 
         // Post AcceptEx        
-        if (!postAccept(m_listenSocket, acceptSocket, ctx)) {
+        if (!postAccept(m_listenSocket, acceptSocket, ctx))
+        {
             return false;
         }
     }
@@ -180,8 +182,9 @@ bool AsyncIOCPServer::postInitialAccepts(int count)
 bool AsyncIOCPServer::createAcceptSocket(SOCKET& acceptSocket)
 {
     acceptSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (acceptSocket == INVALID_SOCKET) {
-        std::cerr << "[SERVER] createAcceptSocket failed: " << WSAGetLastError() << "\n";
+    if (acceptSocket == INVALID_SOCKET)
+    {
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] createAcceptSocket failed: " + std::to_string(WSAGetLastError()) + "\n");
         return false;
     }
     return true;
@@ -211,7 +214,7 @@ bool AsyncIOCPServer::postAccept(SOCKET listenSock, SOCKET acceptSock, PER_SOCKE
         NULL
     ) == SOCKET_ERROR)
     {
-        std::cerr << "[SERVER] WSAIoctl for AcceptEx failed: " << WSAGetLastError() << "\n";
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] WSAIoctl for AcceptEx failed: " + std::to_string(WSAGetLastError()) + "\n");
         return false;
     }
 
@@ -226,24 +229,20 @@ bool AsyncIOCPServer::postAccept(SOCKET listenSock, SOCKET acceptSock, PER_SOCKE
         &ctx->overlapped
     );
 
-    if (!bRet && WSAGetLastError() != ERROR_IO_PENDING) {
-        std::cerr << "[SERVER] AcceptEx failed: " << WSAGetLastError() << "\n";
+    if (!bRet && WSAGetLastError() != ERROR_IO_PENDING)
+    {
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] AcceptEx failed: " + std::to_string(WSAGetLastError()) + "\n");
         return false;
     }
 
-    // Optionally associate the accept socket with IOCP now. However,
-    // typically you do this after AcceptEx completes. 
-    // We'll do it here so we catch completions for this socket on the same IOCP.
-    if (!associateDeviceToIOCP(reinterpret_cast<HANDLE>(acceptSock))) {
+    //associate the accept socket with IOCP
+    if (!associateDeviceToIOCP(reinterpret_cast<HANDLE>(acceptSock)))
+    {
         return false;
     }
 
     return true;
 }
-
-// --------------------------------------------------
-// Static Worker Thread Entry
-// --------------------------------------------------
 
 DWORD WINAPI AsyncIOCPServer::workerThread(LPVOID lpParam)
 {
@@ -253,7 +252,8 @@ DWORD WINAPI AsyncIOCPServer::workerThread(LPVOID lpParam)
     ULONG_PTR completionKey = 0;
     OVERLAPPED* pOverlapped = nullptr;
 
-    while (true) {
+    while (true)
+    {
         BOOL success = GetQueuedCompletionStatus(
             server->m_hIOCP,
             &bytesTransferred,
@@ -264,13 +264,15 @@ DWORD WINAPI AsyncIOCPServer::workerThread(LPVOID lpParam)
 
         // If pOverlapped == nullptr, the IOCP is probably closed (server stopping),
         // or a serious error occurred. Let's break out.
-        if (!success && pOverlapped == nullptr) {
-            std::cerr << "[WORKER] GQCS failed, or server is shutting down. LastError: "
-                << GetLastError() << "\n";
+        if (!success && pOverlapped == nullptr)
+        {
+            ConsoleLogger::getInstance().log(ConsoleLogger::LogLevel::ERR, "[WORKER] GQCS failed, or server is shutting down. LastError: "
+                + std::to_string(GetLastError()) + "\n");
             break;
         }
 
-        if (!pOverlapped) {
+        if (!pOverlapped)
+        {
             // If no overlapped structure is returned, we can't do further processing
             continue;
         }
@@ -283,69 +285,68 @@ DWORD WINAPI AsyncIOCPServer::workerThread(LPVOID lpParam)
     return 0;
 }
 
-// --------------------------------------------------
-// Handle IO completions
-// --------------------------------------------------
-
 void AsyncIOCPServer::handleIO(DWORD bytesTransferred, PER_SOCKET_CONTEXT* ctx)
 {
     DWORD op = ctx->operation;
-    if (bytesTransferred == 0) {
-        switch (op) {
+    if (bytesTransferred == 0)
+    {
+        switch (op) 
+        {
         case OP_ACCEPT:
-            // (A) If it’s AcceptEx with 0 bytes, this just means the client connected 
+        {
+            // If it’s AcceptEx with 0 bytes, this just means the client connected 
             // but didn't send any data immediately.
-            // -> DO NOT close the socket. Instead, we want to post a WSARecv.
-            // 
-            // Step #4 from the previous instructions: 
-            //     "Ensure you post a WSARecv after AcceptEx"
+            m_logger.log(ConsoleLogger::LogLevel::VERBOSE, "[SERVER] OP_ACCEPT returned 0 bytes.");
             
-            {
             // Update the accept socket context
-                int result = setsockopt(
-                    ctx->socket,
-                    SOL_SOCKET,
-                    SO_UPDATE_ACCEPT_CONTEXT,
-                    (char*)&m_listenSocket,
-                    sizeof(m_listenSocket)
-                );
-                if (result == SOCKET_ERROR) {
-                    std::cerr << "[SERVER] setsockopt SO_UPDATE_ACCEPT_CONTEXT failed: "
-                        << WSAGetLastError() << "\n";
-                    closesocket(ctx->socket);
-                    delete ctx;
-                    return;
-                }
+            int result = setsockopt(
+                ctx->socket,
+                SOL_SOCKET,
+                SO_UPDATE_ACCEPT_CONTEXT,
+                (char*)&m_listenSocket,
+                sizeof(m_listenSocket)
+            );
+            if (result == SOCKET_ERROR)
+            {
+                m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] setsockopt SO_UPDATE_ACCEPT_CONTEXT failed: "
+                    + std::to_string(WSAGetLastError()) + "\n");
+                closesocket(ctx->socket);
+                delete ctx;
+                return;
             }
+            
             ctx->operation = OP_RECV; // Mark that we're now going to do a receive
             ZeroMemory(&ctx->overlapped, sizeof(OVERLAPPED));
             ctx->wsabuf.buf = ctx->buffer;
             ctx->wsabuf.len = sizeof(ctx->buffer);
 
+            DWORD flags = 0;
+            m_logger.log(ConsoleLogger::LogLevel::VERBOSE, "[SERVER] Posting Recv after OP_ACCEPT");
+            int ret = WSARecv(ctx->socket, &ctx->wsabuf, 1, NULL, &flags,
+                &ctx->overlapped, NULL);
+            if (ret == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
             {
-                DWORD flags = 0;
-                int ret = WSARecv(ctx->socket, &ctx->wsabuf, 1, NULL, &flags,
-                    &ctx->overlapped, NULL);
-                if (ret == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
-                {
-                    std::cerr << "[SERVER] WSARecv failed after AcceptEx (0 bytes): "
-                        << WSAGetLastError() << "\n";
-                    closesocket(ctx->socket);
-                    delete ctx;
-                }
+                m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] WSARecv failed after AcceptEx (0 bytes): "
+                    + std::to_string(WSAGetLastError()) + "\n");
+                closesocket(ctx->socket);
+                delete ctx;
             }
+            
+        }
             break;
 
         case OP_RECV:
+            m_logger.log(ConsoleLogger::LogLevel::VERBOSE, "[SERVER] OP_RECV returned 0 bytes.");
             // Zero bytes on a RECV means client disconnected
-            std::cerr << "[WORKER] Zero bytes; closing socket.\n";
+            m_logger.log(ConsoleLogger::LogLevel::ERR, "[WORKER] Zero bytes; closing socket.\n");
             closesocket(ctx->socket);
             delete ctx;
             break;
 
         case OP_SEND:
-            // Zero bytes on a SEND is less common; handle if needed
-            std::cerr << "[SERVER] 0 bytes on SEND - closing socket.\n";
+            m_logger.log(ConsoleLogger::LogLevel::VERBOSE, "[SERVER] OP_SEND returned 0 bytes");
+            // Zero bytes on a SEND is uncommon
+            m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] 0 bytes on SEND - closing socket.\n");
             closesocket(ctx->socket);
             delete ctx;
             break;
@@ -356,9 +357,10 @@ void AsyncIOCPServer::handleIO(DWORD bytesTransferred, PER_SOCKET_CONTEXT* ctx)
         switch (ctx->operation)
         {
         case OP_ACCEPT:
-            // (A) AcceptEx completed WITH immediate data in the buffer.
-            // You can process that data if you want. Then, post WSARecv.
         {
+            // AcceptEx completed with immediate data in the buffer.
+            // process the data, then post WSARecv.
+            m_logger.log(ConsoleLogger::LogLevel::VERBOSE, "[SERVER] OP_ACCEPT returned >0 bytes.");
             {
                 // Update the accept socket context
                 int result = setsockopt(
@@ -369,16 +371,17 @@ void AsyncIOCPServer::handleIO(DWORD bytesTransferred, PER_SOCKET_CONTEXT* ctx)
                     sizeof(m_listenSocket)
                 );
                 if (result == SOCKET_ERROR) {
-                    std::cerr << "[SERVER] setsockopt SO_UPDATE_ACCEPT_CONTEXT failed: "
-                        << WSAGetLastError() << "\n";
+                    m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] setsockopt SO_UPDATE_ACCEPT_CONTEXT failed: "
+                        + std::to_string(WSAGetLastError()) + "\n");
                     closesocket(ctx->socket);
                     delete ctx;
                     return;
                 }
             }
 
-            std::cout << "[SERVER] AcceptEx completed with " << bytesTransferred
-                << " bytes of initial data.\n";
+            m_logger.log(ConsoleLogger::LogLevel::INFO, "[SERVER] AcceptEx completed with " + std::to_string(bytesTransferred)
+                + " bytes of initial data.\n");
+
             // Possibly handle the data in ctx->buffer[0..bytesTransferred-1]
             // Then post a WSARecv:
             ctx->operation = OP_RECV;
@@ -387,12 +390,13 @@ void AsyncIOCPServer::handleIO(DWORD bytesTransferred, PER_SOCKET_CONTEXT* ctx)
             ctx->wsabuf.len = sizeof(ctx->buffer);
 
             DWORD flags = 0;
+            m_logger.log(ConsoleLogger::LogLevel::VERBOSE, "[SERVER] Posting Recv after OP_ACCEPT");
             int ret = WSARecv(ctx->socket, &ctx->wsabuf, 1, NULL, &flags,
                 &ctx->overlapped, NULL);
             if (ret == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
             {
-                std::cerr << "[SERVER] WSARecv failed after AcceptEx (>0 bytes): "
-                    << WSAGetLastError() << "\n";
+                m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] WSARecv failed after AcceptEx (>0 bytes): "
+                    + std::to_string(WSAGetLastError()) + "\n");
                 closesocket(ctx->socket);
                 delete ctx;
             }
@@ -400,24 +404,25 @@ void AsyncIOCPServer::handleIO(DWORD bytesTransferred, PER_SOCKET_CONTEXT* ctx)
         break;
 
         case OP_RECV:
-            // (B) We got data from the client. Process it.
-        {
-            std::string msg(ctx->buffer, bytesTransferred);
-            std::cout << "[SERVER] Received from client: " << msg << "\n";
-            // Maybe echo back or do something else.
+        {            
+            // We got data from the client. Process it.
+            m_logger.log(ConsoleLogger::LogLevel::VERBOSE, "[SERVER] OP_RECV returned >0 bytes.");
 
-            // Then post another read if you want continuous reading:
+            std::string msg(ctx->buffer, bytesTransferred);
+            m_logger.log(ConsoleLogger::LogLevel::INFO, "[SERVER] Received from client: " + msg + "\n");
+
             ctx->operation = OP_RECV; // stay in RECV mode
             ZeroMemory(&ctx->overlapped, sizeof(OVERLAPPED));
             ctx->wsabuf.buf = ctx->buffer;
             ctx->wsabuf.len = sizeof(ctx->buffer);
 
             DWORD flags = 0;
+            m_logger.log(ConsoleLogger::LogLevel::VERBOSE, "[SERVER] Posting Recv with OP_RECV");
             int ret = WSARecv(ctx->socket, &ctx->wsabuf, 1, NULL, &flags,
                 &ctx->overlapped, NULL);
             if (ret == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
             {
-                std::cerr << "[SERVER] WSARecv failed: " << WSAGetLastError() << "\n";
+                m_logger.log(ConsoleLogger::LogLevel::ERR, "[SERVER] WSARecv failed: " + std::to_string(WSAGetLastError()) + "\n");
                 closesocket(ctx->socket);
                 delete ctx;
             }
@@ -425,14 +430,10 @@ void AsyncIOCPServer::handleIO(DWORD bytesTransferred, PER_SOCKET_CONTEXT* ctx)
         break;
 
         case OP_SEND:
-            // (C) We finished sending some data to the client
-            // If you have more data to send, you can queue another WSASend.
-            // Otherwise, do nothing or free the context if it's a one-time send.
-            std::cout << "[SERVER] Finished sending " << bytesTransferred << " bytes.\n";
-            // Free or reuse. For example:
-            //delete ctx; // if this was a one-off context
-            break;
+            // We finished sending some data to the client
+            m_logger.log(ConsoleLogger::LogLevel::VERBOSE, "[SERVER] OP_SEND returned >0 bytes.");
+            m_logger.log(ConsoleLogger::LogLevel::INFO, "[SERVER] Finished sending " + std::to_string(bytesTransferred) + " bytes.\n");
+        break;
         }
     }
 }
-

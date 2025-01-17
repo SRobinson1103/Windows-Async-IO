@@ -56,9 +56,11 @@ private:
     HANDLE m_hWorkerThread;
     bool   m_running;
 
-    // For the connect operation (if using ConnectEx)
+    // For the connect operation
     sockaddr_in m_serverAddr;
 
     // IO context for sending/receiving
     CLIENT_IO_CONTEXT* m_ioContext;
+
+    ConsoleLogger& m_logger;
 };

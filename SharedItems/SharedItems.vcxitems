@@ -15,5 +15,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="$(MSBuildThisFileDirectory)CommonIncludes.h" />
+    <ClInclude Include="$(MSBuildThisFileDirectory)ConsoleLogger.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="$(MSBuildThisFileDirectory)ConsoleLogger.cpp" />
   </ItemGroup>
 </Project>
