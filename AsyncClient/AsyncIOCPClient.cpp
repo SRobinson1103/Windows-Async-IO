@@ -89,9 +89,12 @@ bool AsyncIOCPClient::Connect()
     m_ioContext = new CLIENT_IO_CONTEXT{};
     m_ioContext->wsabuf.buf = m_ioContext->buffer;
     m_ioContext->wsabuf.len = sizeof(m_ioContext->buffer);
+    m_ioContext->operation = OP_CONNECT;
 
     // Use ConnectEx in an overlapped manner
     ZeroMemory(&m_ioContext->overlapped, sizeof(OVERLAPPED));
+
+    // parameters can be 0 if no message is sent with connect
     BOOL bRet = lpfnConnectEx(
         m_socket,
         reinterpret_cast<sockaddr*>(&m_serverAddr),
@@ -128,6 +131,7 @@ bool AsyncIOCPClient::Send(const std::string& data)
     // Allocate a fresh IO context for sending
     CLIENT_IO_CONTEXT* sendCtx = new CLIENT_IO_CONTEXT{};
     ZeroMemory(&sendCtx->overlapped, sizeof(OVERLAPPED));
+    sendCtx->operation = OP_SEND;
 
     // Copy data into the buffer
     size_t len = data.size();
@@ -284,6 +288,7 @@ bool AsyncIOCPClient::postRecv(CLIENT_IO_CONTEXT* ctx)
     ZeroMemory(&ctx->overlapped, sizeof(OVERLAPPED));
     ctx->wsabuf.buf = ctx->buffer;
     ctx->wsabuf.len = sizeof(ctx->buffer);
+    ctx->operation == OP_RECV;
 
     DWORD flags = 0;
     DWORD bytesRecv = 0;
@@ -324,7 +329,7 @@ DWORD WINAPI AsyncIOCPClient::workerThread(LPVOID lpParam)
 
         CLIENT_IO_CONTEXT* ioCtx = reinterpret_cast<CLIENT_IO_CONTEXT*>(pOverlapped);
 
-        if (bytesTransferred == 0)
+        if (bytesTransferred == 0 && ioCtx->operation != OP_CONNECT)
         {
             // This usually means the remote side closed the connection
             ConsoleLogger::getInstance().log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Connection closed by server or zero-byte I/O.\n");
@@ -347,7 +352,7 @@ void AsyncIOCPClient::handleIO(DWORD bytesTransferred, CLIENT_IO_CONTEXT* ioCtx)
 
     // If we haven't posted a recv yet, assume we've just connected
     // so we can post the first recv now.
-    if (ioCtx == m_ioContext && m_ioContext->buffer[0] == '\0')
+    if (ioCtx->operation == OP_CONNECT)
     {
         // This might be the completion of ConnectEx if no data was in the buffer.
         m_logger.log(ConsoleLogger::LogLevel::INFO, "[CLIENT] Connection established!\n");

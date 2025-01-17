@@ -2,6 +2,13 @@
 
 #include <CommonIncludes.h>
 
+enum OP_TYPE
+{
+    OP_CONNECT,
+    OP_RECV,
+    OP_SEND
+};
+
 // A small structure that holds I/O data
 struct CLIENT_IO_CONTEXT
 {
@@ -9,6 +16,7 @@ struct CLIENT_IO_CONTEXT
     WSABUF wsabuf;
     char buffer[1024];
     DWORD bytesTransferred;
+    OP_TYPE operation;
 };
 
 class AsyncIOCPClient

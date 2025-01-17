@@ -31,5 +31,7 @@ int main()
 
     // Stop the client
     client.Stop();
+
+    std::cin.get();
     return 0;
 }
