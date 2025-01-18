@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.8.34408.163
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "WindowsAIO", "WindowsAIO.vcxproj", "{17D2AEB5-8294-43DB-8349-E6FE77C29B8E}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "WindowsAIO", "WindowsAIO\WindowsAIO.vcxproj", "{17D2AEB5-8294-43DB-8349-E6FE77C29B8E}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SharedItems", "SharedItems\SharedItems.vcxitems", "{599D8FD3-A032-4545-AEF1-7E2DA7E03F74}"
 EndProject

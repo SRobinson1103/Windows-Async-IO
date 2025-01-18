@@ -1,17 +1,39 @@
 #include "AsyncServer.h"
 
+int maxClients = 100;
+int workerThreads = 4;
+
 int main()
 {
-    // Create a server listening on port 27015 with 2 worker threads
-    AsyncIOCPServer server(27015, 2);
+    AsyncIOCPServer server;
 
-    // Start the server
-    if (!server.Start()) {
-        std::cerr << "[MAIN] Failed to start server.\n";
+    // Set callbacks
+    server.SetOnClientConnect([](ClientID cid)
+    {
+    std::cout << "Client " << cid << " connected.\n";
+    });
+
+    server.SetOnDataReceived([](ClientID cid, const std::string& msg)
+    {
+    std::cout << "Client " << cid << " says: " << msg << "\n";
+    // Echo back
+    // server.SendToClient(cid, "Got your message!");
+    });
+
+    server.SetOnClientDisconnect([](ClientID cid)
+    {
+    std::cout << "Client " << cid << " disconnected.\n";
+    });
+
+    if (!server.Start(27015, maxClients, workerThreads))
+    {
+        std::cerr << "Failed to start server.\n";
         return 1;
     }
 
-    std::cout << "[MAIN] Server running. Press Enter to stop...\n";
+    std::cout << "Server started. Press ENTER to exit.\n";
     std::cin.get();
+
+    server.Stop();
     return 0;
 }

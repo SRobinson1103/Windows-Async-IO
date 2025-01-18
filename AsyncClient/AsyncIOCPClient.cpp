@@ -368,6 +368,12 @@ void AsyncIOCPClient::handleIO(DWORD bytesTransferred, CLIENT_IO_CONTEXT* ioCtx)
             m_logger.log(ConsoleLogger::LogLevel::INFO, "[CLIENT] setsockopt(SO_UPDATE_CONNECT_CONTEXT) succeeded.\n");
         }
 
+        if (bytesTransferred > 0)
+        {
+            // handle the data server just sent
+            std::string msg(ioCtx->buffer, bytesTransferred);
+            m_logger.log(ConsoleLogger::LogLevel::INFO, "[CLIENT] received connect message: " + msg);
+        }
         // Post a read so we can receive data from the server
         if (!postRecv(ioCtx))
         {
