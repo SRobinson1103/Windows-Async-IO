@@ -441,7 +441,6 @@ DWORD WINAPI AsyncIOCPServer::workerThread(LPVOID lpParam)
             auto it = server->m_overlappedMap.find(pOverlapped);
             if (it != server->m_overlappedMap.end())
             {
-                // It's a pending accept context
                 ctx = it->second;
                 //remove old mapping
                 server->m_overlappedMap.erase(it);
@@ -652,6 +651,7 @@ void AsyncIOCPServer::onSendComplete(ClientContext* ctx, DWORD bytesTransferred)
             onClientDisconnect(ctx);
             return;
         }
+
         OVERLAPPED* sendKey = &ctx->recvOverlapped;
         {
             std::lock_guard<std::mutex> lock(m_overlappedMapMutex);
@@ -671,7 +671,7 @@ void AsyncIOCPServer::onSendComplete(ClientContext* ctx, DWORD bytesTransferred)
         else
         {
             // No more data to send, switch operation away from SEND
-            ctx->operation = ClientContext::OperationType::Idle;
+            ctx->operation = ClientContext::OperationType::Recv;
         }
     }
 }

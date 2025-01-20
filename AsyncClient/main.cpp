@@ -1,9 +1,12 @@
 #include "AsyncIOCPClient.h"
 
+std::string host = "127.0.0.1";
+unsigned short port = 27015;
+
 int main()
 {
     // Create an async client that connects to 127.0.0.1:27015
-    AsyncIOCPClient client("127.0.0.1", 27015);
+    AsyncIOCPClient client;
 
     // Start the client (initialize Winsock, IOCP, worker thread)
     if (!client.Start())
@@ -13,7 +16,7 @@ int main()
     }
 
     // Initiate async connection
-    if (!client.Connect())
+    if (!client.Connect(host, port))
     {
         std::cerr << "[MAIN] Connect call failed.\n";
         client.Stop();

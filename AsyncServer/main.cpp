@@ -13,11 +13,11 @@ int main()
     std::cout << "Client " << cid << " connected.\n";
     });
 
-    server.SetOnDataReceived([](ClientID cid, const std::string& msg)
+    server.SetOnDataReceived([&server](ClientID cid, const std::string& msg)
     {
     std::cout << "Client " << cid << " says: " << msg << "\n";
     // Echo back
-    // server.SendToClient(cid, "Got your message!");
+    //server.SendToClient(cid, "Got your message!");
     });
 
     server.SetOnClientDisconnect([](ClientID cid)

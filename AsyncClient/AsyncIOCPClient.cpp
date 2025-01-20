@@ -1,13 +1,11 @@
 #include "AsyncIOCPClient.h"
 
-AsyncIOCPClient::AsyncIOCPClient(const std::string& host, int port)
-    : m_host(host),
-    m_port(port),
+AsyncIOCPClient::AsyncIOCPClient()
+    : m_host(""),
+    m_port(0),
     m_socket(INVALID_SOCKET),
     m_hIOCP(NULL),
-    m_hWorkerThread(NULL),
     m_running(false),
-    m_ioContext(nullptr),
     m_logger(ConsoleLogger::getInstance())
 {
     ZeroMemory(&m_serverAddr, sizeof(m_serverAddr));
@@ -21,7 +19,7 @@ AsyncIOCPClient::~AsyncIOCPClient()
     Stop();
 }
 
-bool AsyncIOCPClient::Start()
+bool AsyncIOCPClient::Start(int workerThreadCount)
 {
     if (!initWinsock())
     {
@@ -33,7 +31,7 @@ bool AsyncIOCPClient::Start()
         m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Socket creation failed.\n");
         return false;
     }
-    if (!createIOCP())
+    if (!createIOCP(workerThreadCount))
     {
         m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] IOCP creation failed.\n");
         return false;
@@ -41,163 +39,137 @@ bool AsyncIOCPClient::Start()
 
     // Create a worker thread to handle all I/O completions
     m_running = true;
-    m_hWorkerThread = CreateThread(nullptr, 0, workerThread, this, 0, nullptr);
-    if (!m_hWorkerThread)
-    {
-        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] CreateThread failed: " + std::to_string(GetLastError()) + "\n");
-        return false;
-    }
 
     return true;
 }
 
-bool AsyncIOCPClient::Connect()
+bool AsyncIOCPClient::Connect(const std::string& host, unsigned short port)
 {
-    // Convert m_host (std::string) to std::wstring
-    std::wstring wHost(m_host.begin(), m_host.end());
+    std::lock_guard<std::mutex> lock(m_ctxMutex);
+    m_host = host;
+    m_port = port;
 
+    m_serverAddr.sin_family = AF_INET;
+    m_serverAddr.sin_port = htons(port);
+
+    // Convert m_host (std::string) to std::wstring
+    std::wstring wHost(host.begin(), host.end());
     // Convert the string host to a numeric address.
     if (InetPton(AF_INET, wHost.c_str(), &m_serverAddr.sin_addr) <= 0)
     {
         m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Invalid host or InetPton failed.\n");
         return false;
     }
-
-    // overlapped connect using ConnectEx.
-    LPFN_CONNECTEX lpfnConnectEx = nullptr;
-    if (!getConnectExPtr(m_socket, lpfnConnectEx))
-    {
-        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Failed to retrieve ConnectEx pointer.\n");
-        return false;
-    }
-
-    // Bind the socket to any local IP/port before using ConnectEx.
+    
+    // Bind local address
     if (!bindAnyAddress(m_socket))
     {
         m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] bindAnyAddress() failed.\n");
         return false;
     }
-
-    // Associate the socket with the IOCP
-    if (!associateSocketToIOCP(m_socket))
+    
+    //get connectEx ptr
+    if (!m_lpfnConnectEx)
     {
-        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Failed to associate socket with IOCP.\n");
+        if (!getConnectExPtr(m_socket, m_lpfnConnectEx))
+        {
+            m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Failed to retrieve ConnectEx pointer.\n");
+            return false;
+        }
+    }
+
+    // Associate socket with IOCP
+    if (!associateSocketWithIOCP(m_socket))
+    {
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Coult not complete connection. Cailed to associate socket with IOCP.");
+        disconnect();
         return false;
     }
 
-    // Create an IO context for this connection
-    m_ioContext = new CLIENT_IO_CONTEXT{};
-    m_ioContext->wsabuf.buf = m_ioContext->buffer;
-    m_ioContext->wsabuf.len = sizeof(m_ioContext->buffer);
-    m_ioContext->operation = OP_CONNECT;
+    // Create the main client context
+    m_ctx = std::make_unique<ClientContext>();
+    ZeroMemory(&m_ctx->connectOverlapped, sizeof(m_ctx->connectOverlapped));
+    m_ctx->operation = ClientContext::Operation::Connect;
 
-    // Use ConnectEx in an overlapped manner
-    ZeroMemory(&m_ioContext->overlapped, sizeof(OVERLAPPED));
-
-    // parameters can be 0 if no message is sent with connect
-    BOOL bRet = lpfnConnectEx(
+    // Asynchronous ConnectEx
+    BOOL bRet = m_lpfnConnectEx(
         m_socket,
-        reinterpret_cast<sockaddr*>(&m_serverAddr),
+        (sockaddr*)&m_serverAddr,
         sizeof(m_serverAddr),
         nullptr,
         0,
         nullptr,
-        &m_ioContext->overlapped
+        &m_ctx->connectOverlapped
     );
-    if (!bRet)
+    if (!bRet && WSAGetLastError() != ERROR_IO_PENDING)
     {
-        int err = WSAGetLastError();
-        if (err != ERROR_IO_PENDING)
-        {
-            m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] ConnectEx failed: " + std::to_string(err) + "\n");
-            return false;
-        }
-        // If it's ERROR_IO_PENDING, the connection is in progress
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] ConnectEx failed: " + std::to_string(WSAGetLastError()) + "\n");
+        return false;
     }
 
-    m_logger.log(ConsoleLogger::LogLevel::INFO, "[CLIENT] Connection initiated (async) to "
-         + m_host  + ":" + std::to_string(m_port) + "\n");
+    // The completion will be delivered to our IOCP thread
+    // Once we get it, we'll call onConnectComplete.
+    m_logger.log(ConsoleLogger::LogLevel::INFO, "[CLIENT] Connection initiated (async) to " + m_host + ":" + std::to_string(m_port) + "\n");
     return true;
 }
 
 bool AsyncIOCPClient::Send(const std::string& data)
 {
-    if (!m_running || m_socket == INVALID_SOCKET)
+    std::lock_guard<std::mutex> lock(m_ctxMutex);
+    if (!m_ctx)
     {
-        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Socket not connected or client not started.\n");
+        // not connected
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Send failed. Client Context does not exist.");
         return false;
     }
 
-    // Allocate a fresh IO context for sending
-    CLIENT_IO_CONTEXT* sendCtx = new CLIENT_IO_CONTEXT{};
-    ZeroMemory(&sendCtx->overlapped, sizeof(OVERLAPPED));
-    sendCtx->operation = OP_SEND;
+    // Enqueue data
+    m_ctx->sendQueue.push_back(data);
 
-    // Copy data into the buffer
-    size_t len = data.size();
-    if (len > sizeof(sendCtx->buffer))
+    // If not currently in "Send" operation, post the next send
+    if (m_ctx->operation != ClientContext::Operation::Send)
     {
-        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Data too large for buffer.\n");
-        delete sendCtx;
-        return false;
-    }
-    memcpy(sendCtx->buffer, data.c_str(), len);
-
-    sendCtx->wsabuf.buf = sendCtx->buffer;
-    sendCtx->wsabuf.len = static_cast<ULONG>(len);
-
-    // Asynchronously send
-    DWORD bytesSent = 0;
-    DWORD flags = 0;
-    int ret = WSASend(m_socket, &sendCtx->wsabuf, 1, &bytesSent, flags,
-        &sendCtx->overlapped, nullptr);
-    if (ret == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
-    {
-        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] WSASend failed: " + std::to_string(WSAGetLastError()) + "\n");
-        closesocket(m_socket);
-        delete sendCtx;
-        return false;
+        postNextSend();
     }
     return true;
 }
 
 void AsyncIOCPClient::Stop()
 {
-    if (!m_running)
-        return;
-
+    if (!m_running) return;
     m_running = false;
 
-    // Close IOCP (this will make GetQueuedCompletionStatus fail in worker thread)
-    CloseHandle(m_hIOCP);
-    m_hIOCP = NULL;
-
-    // Wait for worker thread to exit
-    if (m_hWorkerThread)
+    // Close the IOCP handle to break the worker thread loop
+    if (m_hIOCP != INVALID_HANDLE_VALUE)
     {
-        WaitForSingleObject(m_hWorkerThread, INFINITE);
-        CloseHandle(m_hWorkerThread);
-        m_hWorkerThread = NULL;
+        CloseHandle(m_hIOCP);
+        m_hIOCP = INVALID_HANDLE_VALUE;
     }
 
-    // Close socket
+    // Wait for worker threads
+    for (HANDLE thr : m_workerThreads)
+    {
+        WaitForSingleObject(thr, INFINITE);
+        CloseHandle(thr);
+    }
+    m_workerThreads.clear();
+
+    // Close the socket
     if (m_socket != INVALID_SOCKET)
     {
         closesocket(m_socket);
         m_socket = INVALID_SOCKET;
     }
 
-    // Cleanup the main IO context if allocated
-    if (m_ioContext)
+    // Cleanup context
     {
-        delete m_ioContext;
-        m_ioContext = nullptr;
+        std::lock_guard<std::mutex> lock(m_ctxMutex);
+        m_ctx.reset();
     }
 
-    // Cleanup Winsock
+    // Cleanup winsock
     WSACleanup();
-
-    m_logger.log(ConsoleLogger::LogLevel::INFO, "[CLIENT] Stopped.\n");
+    m_logger.log(ConsoleLogger::LogLevel::INFO, "[CLIENT] Client stopped.");
 }
 
 bool AsyncIOCPClient::initWinsock()
@@ -223,7 +195,7 @@ bool AsyncIOCPClient::createSocket()
     return true;
 }
 
-bool AsyncIOCPClient::createIOCP()
+bool AsyncIOCPClient::createIOCP(int workerThreadCount)
 {
     m_hIOCP = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1);
     if (m_hIOCP == nullptr)
@@ -231,10 +203,18 @@ bool AsyncIOCPClient::createIOCP()
         m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] CreateIoCompletionPort failed: " + std::to_string(GetLastError()) + "\n");
         return false;
     }
+
+    // Create worker threads
+    for (int i = 0; i < workerThreadCount; ++i)
+    {
+        HANDLE thr = CreateThread(nullptr, 0, workerThread, this, 0, nullptr);
+        if (!thr) return false;
+        m_workerThreads.push_back(thr);
+    }
     return true;
 }
 
-bool AsyncIOCPClient::associateSocketToIOCP(SOCKET s, ULONG_PTR completionKey)
+bool AsyncIOCPClient::associateSocketWithIOCP(SOCKET s, ULONG_PTR completionKey)
 {
     HANDLE h = CreateIoCompletionPort(reinterpret_cast<HANDLE>(s), m_hIOCP, completionKey, 1);
     if (h == nullptr)
@@ -288,7 +268,7 @@ bool AsyncIOCPClient::postRecv(CLIENT_IO_CONTEXT* ctx)
     ZeroMemory(&ctx->overlapped, sizeof(OVERLAPPED));
     ctx->wsabuf.buf = ctx->buffer;
     ctx->wsabuf.len = sizeof(ctx->buffer);
-    ctx->operation == OP_RECV;
+    ctx->operation = OP_RECV;
 
     DWORD flags = 0;
     DWORD bytesRecv = 0;
@@ -305,7 +285,7 @@ DWORD WINAPI AsyncIOCPClient::workerThread(LPVOID lpParam)
 {
     AsyncIOCPClient* client = reinterpret_cast<AsyncIOCPClient*>(lpParam);
     DWORD bytesTransferred = 0;
-    ULONG_PTR completionKey = 0;
+    ULONG_PTR compKey = 0;
     OVERLAPPED* pOverlapped = nullptr;
 
     while (true)
@@ -313,86 +293,250 @@ DWORD WINAPI AsyncIOCPClient::workerThread(LPVOID lpParam)
         BOOL success = GetQueuedCompletionStatus(
             client->m_hIOCP,
             &bytesTransferred,
-            &completionKey,
+            &compKey,
             &pOverlapped,
             INFINITE
         );
         if (!success && pOverlapped == nullptr)
         {
-            // IOCP closed or serious error
-            // This likely means the client is shutting down
+            ConsoleLogger::getInstance().log(ConsoleLogger::LogLevel::ERR, "[CLIENT] IOCP handle closed. Shutting down.");
             break;
         }
-        if (!pOverlapped) {
-            break;
-        }
+        if (!pOverlapped) continue;
 
-        CLIENT_IO_CONTEXT* ioCtx = reinterpret_cast<CLIENT_IO_CONTEXT*>(pOverlapped);
-
-        if (bytesTransferred == 0 && ioCtx->operation != OP_CONNECT)
-        {
-            // This usually means the remote side closed the connection
-            ConsoleLogger::getInstance().log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Connection closed by server or zero-byte I/O.\n");
-            closesocket(client->m_socket);
-            delete ioCtx; // free this context
-            client->m_ioContext = nullptr;
-            break;
-        }
-
-        // Let the instance handle the completion
-        client->handleIO(bytesTransferred, ioCtx);
+        // handleIO will figure out what operation finished
+        client->handleIO(bytesTransferred, pOverlapped);
     }
-
     return 0;
 }
 
-void AsyncIOCPClient::handleIO(DWORD bytesTransferred, CLIENT_IO_CONTEXT* ioCtx)
+void AsyncIOCPClient::handleIO(DWORD bytesTransferred, OVERLAPPED* pOverlapped)
 {
-    // We need to figure out if this is the result of a ConnectEx, a Send, or a Recv
-
-    // If we haven't posted a recv yet, assume we've just connected
-    // so we can post the first recv now.
-    if (ioCtx->operation == OP_CONNECT)
+    std::lock_guard<std::mutex> lock(m_ctxMutex);
+    if (!m_ctx)
     {
-        // This might be the completion of ConnectEx if no data was in the buffer.
-        m_logger.log(ConsoleLogger::LogLevel::INFO, "[CLIENT] Connection established!\n");
+        // may have disconnected
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Client context null in handleIO.");
+        return;
+    }
+    // Check which overlapped
+    if (pOverlapped == &m_ctx->connectOverlapped)
+    {
+        onConnectComplete(m_ctx.get(), bytesTransferred);
+    }
+    else if (pOverlapped == &m_ctx->recvOverlapped)
+    {
+        onRecvComplete(m_ctx.get(), bytesTransferred);
+    }
+    else if (pOverlapped == &m_ctx->sendOverlapped)
+    {
+        onSendComplete(m_ctx.get(), bytesTransferred);
+    }
+}
 
-        int result = setsockopt(m_socket, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0);
-        if (result == SOCKET_ERROR)
-        {
-            m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] setsockopt(SO_UPDATE_CONNECT_CONTEXT) failed: "
-                + std::to_string(WSAGetLastError()) + "\n");
-        }
-        else
-        {
-            m_logger.log(ConsoleLogger::LogLevel::INFO, "[CLIENT] setsockopt(SO_UPDATE_CONNECT_CONTEXT) succeeded.\n");
-        }
+void AsyncIOCPClient::onConnectComplete(ClientContext* ctx, DWORD bytesTransferred)
+{
+    // Confirm the ConnectEx operation completed successfully
+    DWORD flags = 0;
+    DWORD bytes = 0;
+    BOOL result = WSAGetOverlappedResult(
+        m_socket,
+        &m_ctx->connectOverlapped,
+        &bytes,
+        FALSE,   // don't wait (should already be completed)
+        &flags
+    );
 
-        if (bytesTransferred > 0)
-        {
-            // handle the data server just sent
-            std::string msg(ioCtx->buffer, bytesTransferred);
-            m_logger.log(ConsoleLogger::LogLevel::INFO, "[CLIENT] received connect message: " + msg);
-        }
-        // Post a read so we can receive data from the server
-        if (!postRecv(ioCtx))
-        {
-            m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] postRecv failed after connect.\n");
-        }
+    if (!result)
+    {
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] ConnectEx did not complete successfully. Error: " + std::to_string(WSAGetLastError()) + "\n");
+        disconnect();
         return;
     }
 
-    // Otherwise, if we have data in buffer, interpret it as received data
-    // and maybe post another recv.
-    if (bytesTransferred > 0)
+    int r = setsockopt(m_socket, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0);
+    if (r == SOCKET_ERROR)
     {
-        std::string received(ioCtx->buffer, bytesTransferred);
-        m_logger.log(ConsoleLogger::LogLevel::INFO, "[CLIENT] Received: " + received + "\n");
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Could not complete connection: "+ std::to_string(WSAGetLastError()) + ".");
+        disconnect();
+        return;
     }
 
-    // Post another recv for continuous reading
-    if (!postRecv(ioCtx))
+    // Mark connected
+    ctx->connected = true;
+    m_logger.log(ConsoleLogger::LogLevel::INFO, "[CLIENT] Connection complete.");
+
+    // Fire onConnect callback
+    if (m_onConnect)
     {
-        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] postRecv failed.\n");
+        m_onConnect();
+    }
+
+    // If there are queued messages, start sending them
+    if (!ctx->sendQueue.empty())
+    {
+        postNextSend();
+    }
+
+    // Post first recv
+    postRecv();
+}
+
+void AsyncIOCPClient::onRecvComplete(ClientContext* ctx, DWORD bytesTransferred)
+{
+    if (bytesTransferred == 0)
+    {
+        // Sevrer closed. Fire onDisconnect callback
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Did not receive data. Server closed.");
+        if (m_onDisconnect)
+        {
+            m_onDisconnect();
+        }
+        disconnect();
+        return;
+    }
+
+    // We got data
+    std::string msg(ctx->recvBuffer, bytesTransferred);
+
+    // Fire onDataReceived callback
+    if (m_onDataReceived)
+    {
+        m_onDataReceived(msg);
+    }
+
+    // Post another recv
+    postRecv();
+}
+
+bool AsyncIOCPClient::postRecv()
+{
+    if (!m_ctx || !m_ctx->connected)
+    {
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Could not receive data. Not connected.");
+        return false;
+    }
+
+    ZeroMemory(&m_ctx->recvOverlapped, sizeof(m_ctx->recvOverlapped));
+    m_ctx->recvWSABuf.buf = m_ctx->recvBuffer;
+    m_ctx->recvWSABuf.len = sizeof(m_ctx->recvBuffer);
+
+    DWORD flags = 0;
+    DWORD bytesRecv = 0;
+    int ret = WSARecv(m_socket, &m_ctx->recvWSABuf, 1, &bytesRecv, &flags, &m_ctx->recvOverlapped, nullptr);
+    if (ret == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
+    {
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Failed to post WSARecv.");
+        disconnect();
+        return false;
+    }
+    return true;
+}
+
+void AsyncIOCPClient::onSendComplete(ClientContext* ctx, DWORD bytesTransferred)
+{
+    if (bytesTransferred == 0)
+    {
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Could not perform send.");
+        if (m_onDisconnect)
+        {
+            m_onDisconnect();
+        }
+        disconnect();
+        return;
+    }
+
+    ctx->bytesSentSoFar += bytesTransferred;
+    const auto& frontMsg = ctx->sendQueue.front();
+    if (ctx->bytesSentSoFar < frontMsg.size())
+    {
+        // partial send
+        size_t remaining = frontMsg.size() - ctx->bytesSentSoFar;
+        size_t chunk = std::min(remaining, sizeof(ctx->sendBuffer));
+        memcpy(ctx->sendBuffer,
+            frontMsg.data() + ctx->bytesSentSoFar,
+            chunk);
+
+        ctx->sendWSABuf.buf = ctx->sendBuffer;
+        ctx->sendWSABuf.len = (ULONG)chunk;
+
+        ZeroMemory(&ctx->sendOverlapped, sizeof(ctx->sendOverlapped));
+        DWORD flags = 0, sent = 0;
+        int ret = WSASend(m_socket, &ctx->sendWSABuf, 1, &sent, flags, &ctx->sendOverlapped, nullptr);
+        if (ret == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
+        {
+            m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Failed to post next WSASend.");
+            disconnect();
+        }
+    }
+    else
+    {
+        // front message done
+        ctx->sendQueue.pop_front();
+        if (!ctx->sendQueue.empty())
+        {
+            // send next
+            postNextSend();
+        }
+        else
+        {
+            // no more data => idle
+            ctx->operation = ClientContext::Operation::Recv;
+        }
+    }
+}
+
+void AsyncIOCPClient::postNextSend()
+{
+    if (!m_ctx)
+    {
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Could not post next send. Client context does not exist.");
+        return;
+    }
+    if (m_ctx->sendQueue.empty())
+    {
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Could not post next send. No data to send.");
+        return;
+    }
+
+    // Prepare first chunk
+    const std::string& frontMsg = m_ctx->sendQueue.front();
+    m_ctx->bytesToSend = frontMsg.size();
+    m_ctx->bytesSentSoFar = 0;
+
+    size_t chunk = std::min(frontMsg.size(), sizeof(m_ctx->sendBuffer));
+    memcpy(m_ctx->sendBuffer, frontMsg.data(), chunk);
+
+    m_ctx->sendWSABuf.buf = m_ctx->sendBuffer;
+    m_ctx->sendWSABuf.len = (ULONG)chunk;
+
+    m_ctx->operation = ClientContext::Operation::Send;
+    ZeroMemory(&m_ctx->sendOverlapped, sizeof(m_ctx->sendOverlapped));
+
+    DWORD flags = 0, bytesSent = 0;
+    int ret = WSASend(m_socket, &m_ctx->sendWSABuf, 1, &bytesSent, flags,
+        &m_ctx->sendOverlapped, nullptr);
+    if (ret == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
+    {
+        m_logger.log(ConsoleLogger::LogLevel::ERR, "[CLIENT] Failed to post WSASend.");
+        disconnect();
+    }
+}
+
+void AsyncIOCPClient::disconnect()
+{
+    m_logger.log(ConsoleLogger::LogLevel::INFO, "[CLIENT] Disconnecting...");
+    // Close the socket
+    if (m_socket != INVALID_SOCKET)
+    {
+        closesocket(m_socket);
+        m_socket = INVALID_SOCKET;
+    }
+
+    // Clear context
+    if (m_ctx) 
+    {
+        m_ctx->connected = false;
+        m_ctx.reset();
     }
 }
